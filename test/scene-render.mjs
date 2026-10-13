@@ -25,8 +25,10 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CLIENT = path.join(HERE, '..', 'client.js');
+// Point WPE_LIBRARY at your own workshop folder (Steam's app id for Wallpaper
+// Engine is 431960); WPE_OUT sets where the rendered PNGs go.
 const BASE = process.env.WPE_LIBRARY
-  || 'D:\\Steam\\steamapps\\workshop\\content\\431960';
+  || 'C:\\Program Files (x86)\\Steam\\steamapps\\workshop\\content\\431960';
 const OUT = process.env.WPE_OUT || path.join(HERE, 'out');
 
 /* ── minimal PNG encode (RGBA) ─────────────────────────────────────── */

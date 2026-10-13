@@ -101,6 +101,31 @@ The whole plugin is client-side.
    translucent — which is the only way to change them, since the theme
    presenter writes them as inline styles on `<body>`.
 
+## Development
+
+The plugin is one hand-written browser file, `client.js`, and it has no build
+step: edit it, then reload the DSH window (a hard reload, because the client
+module is cached).
+
+The scene renderer — everything between `#region scene-renderer` and
+`#endregion scene-renderer` — is deliberately kept free of React and of DOM
+APIs except `document.createElement('canvas')`, `createImageBitmap` and
+`Blob`, so it can be evaluated headlessly:
+
+```sh
+node test/scene-render.mjs 2372608028            # composite -> test/out/*.png
+node test/scene-render.mjs 2372608028 --layers   # per-object placement report
+WPE_LIBRARY=~/.steam/steam/steamapps/workshop/content/431960 node test/scene-render.mjs ...
+```
+
+The harness shims a canvas into Node, so it renders with the same code the
+browser runs; only JPEG mips need a real browser (`createImageBitmap`), which is
+why a wallpaper whose artwork is a single JPEG stream reports `no layers` there.
+It is how this renderer was checked against a Python reference implementation
+and against the wallpapers' own preview images: identical layer stacks for all
+63 scene packages in the sampled library, and pixel-identical composites
+(mean channel difference ≤ 2.2) for the sampled ids.
+
 ## Limitations
 
 - **Video wallpapers are not played.** Wallpapers of type `video` carry an
@@ -191,6 +216,20 @@ dsh plugin install /本仓库的绝对路径/dsh-wallpaper-engine
 2. **列清单**：标题 + 小缩略图构成选择器。这一步只读很小的预览文件，所以即使壁纸库很大也很快。
 3. **合成**：当你选中一张 `scene` 壁纸时，解析它的 `scene.pkg`：PKGV 文件表、`scene.json` 的对象列表，以及每个对象的 模型 → 材质 → `.tex` 链路。贴图被逐一解码（内嵌 PNG/JPEG 流、原始 RGBA、DXT5/DXT1、单通道遮罩，容器标记为 LZ4 时先解压），然后自下而上合成成 1920px 宽的整幅画面 —— 也就是 Wallpaper Engine 会显示的那张图。**只对你实际选中的那张做这件事。**
 4. **应用**：原画变成一个 Blob URL，放在 `position: fixed; z-index: -1` 的层上。由于 CSS 绘制顺序里所有普通块级元素（`html`、`body`、`#root`、应用框架）都画在负层级元素**之上**，必须把框架背景清成透明，并用 `theme.overrideTokens()` 把面板 token 改成半透明 —— 这是唯一可行的办法，因为主题呈现器把这些 token 作为**内联样式写在 `<body>` 上**，CSS 规则（哪怕加了 `!important`）都盖不过它。
+
+### 开发
+
+整个插件就是一个手写的浏览器文件 `client.js`，**没有构建步骤**：改完刷新 DSH 窗口即可（要硬刷新，客户端模块有缓存）。
+
+场景合成器（`client.js` 里 `#region scene-renderer` 到 `#endregion scene-renderer` 之间）刻意不依赖 React，除 `document.createElement('canvas')`、`createImageBitmap`、`Blob` 外不碰 DOM，所以可以脱离浏览器跑：
+
+```sh
+node test/scene-render.mjs 2372608028            # 合成，输出到 test/out/*.png
+node test/scene-render.mjs 2372608028 --layers   # 逐对象打印摆放结果
+WPE_LIBRARY=~/.steam/steam/steamapps/workshop/content/431960 node test/scene-render.mjs ...
+```
+
+这个 harness 在 Node 里垫了一个 canvas，跑的是浏览器里同一份代码；只有 JPEG 的 mip 需要真正的浏览器（`createImageBitmap`），所以「原画本身就是单张 JPEG」的壁纸在这里会报 `no layers`。当初就是用它跟一份 Python 参考实现、以及壁纸自带的预览图逐张核对的：抽样库里 63 个场景包的图层栈完全一致，抽样的 id 合成结果逐像素一致（平均通道差 ≤ 2.2）。
 
 ### 已知限制
 
