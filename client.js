@@ -51,6 +51,10 @@ window.__ModuleLoader__.load({
     // At or above this, an embedded scene.pkg texture is clearly the better
     // source — sharp enough to be worth giving up an animation for.
     const HIGH_RES_WIDTH = 1280;
+    // Minimum luminance contrast for a candidate to count as artwork rather
+    // than an effect mask or a blank frame. Real artwork scored 41-79 in this
+    // library, masks 0-16.
+    const MIN_DETAIL = 20;
 
     /* ── small utilities ────────────────────────────────────────────── */
 
@@ -197,6 +201,44 @@ window.__ModuleLoader__.load({
       return new Promise((resolve) => {
         const im = new Image();
         im.onload = () => resolve({ url, w: im.naturalWidth, h: im.naturalHeight });
+        im.onerror = () => resolve(null);
+        im.src = url;
+      });
+    }
+
+    /**
+     * Luminance standard deviation of an image, measured on a 64x64 reduction.
+     * A scene.pkg keeps effect and mask textures beside the artwork — often at
+     * the *exact same pixel size* — so area alone cannot tell them apart. In a
+     * survey of this library every real artwork scored 41-79 while masks and
+     * blank frames scored 0-16, so contrast is the discriminator.
+     */
+    function detailScore(url) {
+      return new Promise((resolve) => {
+        const im = new Image();
+        im.onload = () => {
+          try {
+            const N = 64;
+            const canvas = document.createElement('canvas');
+            canvas.width = N;
+            canvas.height = N;
+            const g = canvas.getContext('2d', { willReadFrequently: true });
+            g.drawImage(im, 0, 0, N, N);
+            const d = g.getImageData(0, 0, N, N).data;
+            let sum = 0;
+            let sumSq = 0;
+            const n = d.length / 4;
+            for (let i = 0; i < d.length; i += 4) {
+              const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+              sum += lum;
+              sumSq += lum * lum;
+            }
+            const mean = sum / n;
+            resolve(Math.sqrt(Math.max(0, sumSq / n - mean * mean)));
+          } catch (e) {
+            resolve(null);
+          }
+        };
         im.onerror = () => resolve(null);
         im.src = url;
       });
@@ -535,6 +577,11 @@ html, body, #root {
         if (m) candidates.push(m);
       }
 
+      // Score every candidate by contrast before choosing.
+      for (let i = 0; i < candidates.length; i += 1) {
+        candidates[i].detail = await detailScore(candidates[i].url);
+      }
+
       let pick = null;
       if (useAnimated && previewUrl) {
         // Animation was asked for outright.
@@ -542,13 +589,16 @@ html, body, #root {
       }
       if (!pick) {
         const ranked = candidates.slice().sort((a, b) => b.w * b.h - a.w * a.h);
-        // A high-resolution texture is worth losing the animation for; a small
-        // one is not, so the moving preview wins there.
-        const sharp = ranked.find((c) => c.url !== previewUrl && c.w >= HIGH_RES_WIDTH);
+        // Drop masks and blank frames; keep a null score (measurement failed)
+        // rather than silently discarding a candidate. If nothing survives,
+        // fall back to everything so a wallpaper is never left blank.
+        const solid = ranked.filter((c) => c.detail === null || c.detail >= MIN_DETAIL);
+        const pool = solid.length > 0 ? solid : ranked;
+        const sharp = pool.find((c) => c.url !== previewUrl && c.w >= HIGH_RES_WIDTH);
         pick = sharp
-          || ranked.find((c) => c.url === previewUrl)
-          || ranked.find((c) => c.w >= MIN_USABLE_WIDTH)
-          || ranked[0]
+          || pool.find((c) => c.url === previewUrl)
+          || pool.find((c) => c.w >= MIN_USABLE_WIDTH)
+          || pool[0]
           || null;
       }
       if (!pick) return;
@@ -568,7 +618,7 @@ html, body, #root {
       if (useAnimated && stillUrl && stillUrl !== pick.url) urls.push(stillUrl);
 
       artworkCache.set(cacheKey, urls);
-      artworkRes.set(id, pick.w + '×' + pick.h);
+      artworkRes.set(id, { w: pick.w, h: pick.h, detail: pick.detail });
       if (layer) { layer.urls = urls; sync(); }
       emit();
     }
@@ -751,7 +801,7 @@ html, body, #root {
                 fontSize: '12px', marginTop: '2px',
                 color: (function () {
                   const r = artworkRes.get(cur.wallpaper);
-                  return r && parseInt(r, 10) < 1280
+                  return r && r.w < 1280
                     ? 'var(--dsw-alias-state-warn-primary)'
                     : 'var(--dsw-alias-label-tertiary)';
                 })(),
@@ -759,11 +809,39 @@ html, body, #root {
             }, (function () {
               const r = artworkRes.get(cur.wallpaper);
               if (!r) return '正在解析源图…';
-              const w = parseInt(r, 10);
-              if (w >= 1920) return '源图 ' + r + ' · 清晰';
-              if (w >= 1280) return '源图 ' + r + ' · 尚可';
-              return '源图仅 ' + r + ' · 放大会糊，可调高「壁纸模糊」掩盖';
+              const size = r.w + '×' + r.h;
+              const detail = (r.detail === null || r.detail === undefined)
+                ? '?'
+                : Math.round(r.detail);
+              const tag = r.w >= 1920 ? '清晰'
+                : r.w >= 1280 ? '尚可'
+                : '放大会糊，可调高「壁纸模糊」掩盖';
+              return '源图 ' + size + ' · 对比度 ' + detail + ' · ' + tag;
             })()) : null,
+            /* Live layer state, so a wallpaper that resolves but does not paint
+               can be told apart from one that never resolved. */
+            h('div', {
+              style: {
+                fontSize: '11px', marginTop: '4px',
+                fontFamily: 'ui-monospace, Consolas, monospace',
+                color: 'var(--dsw-alias-label-caption)',
+                overflowWrap: 'anywhere',
+              },
+            }, (function () {
+              if (!layer) return '图层: 未创建';
+              const urls = layer.urls || [];
+              const inDoc = document.body.contains(layer.root);
+              const bg = String(getComputedStyle(layer.img).backgroundImage);
+              const frame = document.querySelector('[class*="_frame"]');
+              const frameBg = frame ? getComputedStyle(frame).backgroundColor : '?';
+              return '图层 ' + urls.length + ' 张 · display='
+                + (layer.root.style.display || '默认')
+                + ' · 在DOM=' + (inDoc ? '是' : '否')
+                + ' · token=' + (disposeTokens ? '已注入' : '未注入')
+                + ' · theme=' + (theme() ? '有' : '无')
+                + ' · 框架bg=' + frameBg
+                + ' · ' + (bg === 'none' ? '背景=无' : bg.slice(0, 22));
+            })()),
             h('div', {
               style: {
                 fontSize: '12px', marginTop: '2px',
