@@ -61,9 +61,16 @@ already on.
    - macOS: `~/Library/Application Support/Steam/steamapps/workshop/content/431960`
 3. Pick a wallpaper from the grid, then tune the sliders.
 
-> The folder selection is remembered when the browser allows it. If it is not
-> remembered, you will be asked to re-select the folder after a reload — that is
-> a browser security rule, not a bug.
+> **New wallpapers.** There is no filesystem watcher — the browser exposes no
+> directory-change event — so a wallpaper you download in Wallpaper Engine will
+> not appear by itself. Press **Rescan** in the settings page (or reload), and it
+> is picked up.
+>
+> **Across a browser restart.** The folder handle is stored in IndexedDB. When
+> the browser still grants read access the library reloads by itself; when the
+> grant has lapsed back to "prompt" (which needs a user gesture), a one-click
+> **Grant access and scan** button appears instead. That is a browser security
+> rule, not a bug.
 
 ## How it works
 
@@ -161,7 +168,9 @@ dsh plugin install /本仓库的绝对路径/dsh-wallpaper-engine
    - macOS：`~/Library/Application Support/Steam/steamapps/workshop/content/431960`
 3. 在网格里选一张壁纸，然后用滑块调整观感。
 
-> 文件夹选择在浏览器允许的情况下会被记住。如果没有记住，刷新后需要重新选一次 —— 这是浏览器的安全规定，不是 bug。
+> **新下载的壁纸。** 没有文件系统监听 —— 浏览器不提供目录变更事件 —— 所以你在 Wallpaper Engine 里新下载的壁纸不会自己冒出来。在设置页点一下 **「重新扫描」**（或者刷新页面）就会读到。
+>
+> **浏览器重启后。** 文件夹句柄存在 IndexedDB 里。浏览器仍保留读取授权时，壁纸库会自动恢复；授权回退成"需要询问"时（这种情况必须要用户点一下），界面会显示一个 **「恢复授权并扫描」** 按钮，点一次即可。这是浏览器的安全规定，不是 bug。
 
 ### 工作原理
 

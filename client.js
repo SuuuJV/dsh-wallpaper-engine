@@ -404,6 +404,8 @@ html, body, #root {
     let disposeTokens = null;
     let themeSvc = null;
     let ctxRef = null;
+    /** Handle remembered in IndexedDB whose read access lapsed to "prompt". */
+    let remembered = null;
     /** Cache of extracted artwork URLs, keyed by workshop id. */
     const artworkCache = new Map();
     /** Resolved source resolution per wallpaper id, for honest UI feedback. */
@@ -704,10 +706,39 @@ html, body, #root {
         /* folder picker */
         h(Row, null,
           h(Label, null, '壁纸库文件夹'),
-          h(Button, { onClick: pickFolder, primary: !status.source }, '选择文件夹…'),
+          h(Button, {
+            onClick: pickFolder,
+            primary: !status.source && !status.needsPermission,
+          }, '选择文件夹…'),
+          status.source && status.source.kind === 'handle' ? h(Button, {
+            onClick: () => adoptSource(status.source),
+            disabled: status.scanning,
+          }, '重新扫描') : null,
           h('span', {
             style: { fontSize: '12px', color: 'var(--dsw-alias-label-tertiary)', minWidth: 0 },
-          }, status.source ? status.source.name : '例如 …\\workshop\\content\\431960')),
+          }, status.source
+            ? status.source.name + '　（新下载的壁纸点「重新扫描」）'
+            : '例如 …\\workshop\\content\\431960')),
+
+        /* access lapsed across a restart: one click re-grants it */
+        status.needsPermission ? h(Row, null,
+          h(Label, null, '上次的壁纸库'),
+          h(Button, {
+            primary: true,
+            onClick: async () => {
+              try {
+                const perm = await remembered.requestPermission({ mode: 'read' });
+                if (perm !== 'granted') return;
+                const handle = remembered;
+                remembered = null;
+                status = { ...status, needsPermission: false };
+                await adoptSource(sourceFromHandle(handle));
+              } catch (e) { /* stay on the button */ }
+            },
+          }, '恢复授权并扫描'),
+          h('span', {
+            style: { fontSize: '12px', color: 'var(--dsw-alias-label-tertiary)' },
+          }, '重启后浏览器需要你再授权一次')) : null,
 
         /* animated previews: sharper still vs moving GIF */
         h(Row, null,
@@ -850,16 +881,25 @@ html, body, #root {
             }
           }, 250);
 
-          // Restore the library automatically when the browser still grants
-          // access to the remembered folder.
+          // Restore the remembered folder. Its read access can lapse back to
+          // "prompt" across a restart, and re-granting needs a user gesture, so
+          // keep the handle and surface a button instead of silently doing
+          // nothing. A rescan also picks up wallpapers downloaded since last
+          // time — there is no filesystem watcher, so this is how new ones
+          // appear.
           let cancelled = false;
           loadHandle().then(async (handle) => {
             if (cancelled || !handle || !handle.queryPermission) return;
             try {
-              const state = await handle.queryPermission({ mode: 'read' });
-              if (state !== 'granted') return;
-              await adoptSource(sourceFromHandle(handle));
-            } catch (e) { /* user will just re-pick the folder */ }
+              const perm = await handle.queryPermission({ mode: 'read' });
+              if (perm === 'granted') {
+                await adoptSource(sourceFromHandle(handle));
+                return;
+              }
+            } catch (e) { /* fall through to the manual grant */ }
+            remembered = handle;
+            status = { ...status, needsPermission: true };
+            emit();
           });
 
           return () => {
