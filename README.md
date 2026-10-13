@@ -19,6 +19,9 @@ Unlike most theme plugins, this one reads your actual workshop library — and f
   its textures as plain JPEG/PNG streams, so they can be recovered by scanning
   for image magic bytes. This gets you the original 1920×1080 / 3840×2160 art
   rather than the small preview thumbnail.
+- **Animated previews** — many wallpapers ship an animated `preview.gif`
+  instead of a still. The picker marks those with a 动 badge, and a toggle lets
+  you prefer the animation over the sharper extracted still.
 - **Picker with search** — thumbnail grid, filter by title or workshop id.
 - **Four live sliders** — panel opacity, wallpaper blur, background dim, and
   wallpaper brightness. Everything is persisted per browser.
@@ -87,9 +90,15 @@ The whole plugin is client-side.
 
 ## Limitations
 
-- **Video wallpapers get the preview image.** Wallpapers of type `video` have an
-  `.mp4` instead of a `scene.pkg`. Playing it would cost a permanently decoding
-  video, so this plugin uses their `preview.jpg` still instead.
+- **Video wallpapers are not played.** Wallpapers of type `video` carry an
+  `.mp4` instead of a `scene.pkg`. Decoding video behind the UI would cost CPU
+  continuously, so this plugin uses their preview file instead — which, when it
+  is a `preview.gif`, happens to animate for free.
+- **The animated option trades sharpness for motion.** A `preview.gif` is a few
+  hundred pixels wide, so preferring it over the extracted `scene.pkg` artwork
+  is visibly softer. In the sampled library 36 of 86 wallpapers had an animated
+  preview, and 21 of those also had a `scene.pkg` — meaning the toggle actually
+  changes the result for them.
 - **`scene.pkg` extraction is heuristic.** It finds the largest embedded image.
   A few packages store nothing usable (their preview image is used instead), and
   theoretically a package could have a larger decorative texture than its
@@ -117,6 +126,7 @@ files on your own machine and ships none of them.
 
 - **读取你真实的壁纸库** —— 指向你的 Steam 创意工坊目录，列出每一张订阅壁纸的名称。
 - **全分辨率原图** —— Wallpaper Engine 的 `scene.pkg` 内部以明文 JPEG/PNG 流存放贴图，通过扫描图片魔数即可提取。拿到的是原始 1920×1080 / 3840×2160 画面，而不是小预览图。
+- **支持动态壁纸** —— 不少壁纸用的是会动的 `preview.gif` 而不是静态图。选择器会给这类壁纸打上「动」标记，并有开关让你在「动图」和「更清晰的 pkg 原图」之间二选一。
 - **带搜索的选择器** —— 缩略图网格，可按名称或创意工坊 ID 过滤。
 - **四个实时滑块** —— 面板透明度、壁纸模糊、背景压暗、壁纸亮度。设置按浏览器保存。
 - **适配明暗主题** —— 叠加色调跟随应用配色，两种模式下文字都清晰。
@@ -156,7 +166,8 @@ dsh plugin install /本仓库的绝对路径/dsh-wallpaper-engine
 
 ### 已知限制
 
-- **视频类壁纸只能用预览图。** `video` 类型的壁纸是 `.mp4` 而不是 `scene.pkg`。持续解码视频代价太大，所以这类壁纸用它们的 `preview.jpg` 静帧。
+- **视频类壁纸不会被播放。** `video` 类型的壁纸是 `.mp4` 而不是 `scene.pkg`。在界面背后持续解码视频会一直占用 CPU，所以这类壁纸用它们的预览文件 —— 而当预览文件是 `preview.gif` 时，它正好是动的，等于白捡了动态效果。
+- **动态选项是拿清晰度换动作。** `preview.gif` 只有几百像素宽，所以优先用它会明显比抠出来的 `scene.pkg` 原图糊。在抽样的壁纸库里，86 张中有 36 张带动态预览，其中 21 张同时也有 `scene.pkg` —— 也就是说对它们而言这个开关是真的会改变效果的。
 - **`scene.pkg` 提取是启发式的。** 它取内嵌图片里最大的一张。少数包没有可用图片（则回退到预览图），理论上也可能存在比原画更大的装饰性贴图。抽样的 86 张壁纸里，58 张提取正确。
 - **刷新后可能需要重新选文件夹**，取决于浏览器对目录句柄的持久化行为。
 - **Steam 的每张壁纸文件夹以创意工坊 ID 命名**，看不出画面内容；标题来自各自的 `project.json`。

@@ -33,6 +33,9 @@ window.__ModuleLoader__.load({
       blur: 0,
       dim: 0.25,
       imageOpacity: 1,
+      // Off by default: the carved scene.pkg artwork is far sharper than the
+      // animated GIF preview. Turn it on to trade sharpness for motion.
+      preferAnimated: false,
     };
 
     const PREVIEW_NAMES = ['preview.jpg', 'preview.jpeg', 'preview.png', 'preview.gif', 'preview.webp'];
@@ -274,7 +277,13 @@ window.__ModuleLoader__.load({
           if (pf) thumb = URL.createObjectURL(pf);
         }
 
-        out.push({ id, title, type, thumb });
+        out.push({
+          id,
+          title,
+          type,
+          thumb,
+          animated: previewName === 'preview.gif',
+        });
         if (onProgress && i % 8 === 0) onProgress(i + 1, dirs.length);
       }
       out.sort((a, b) => a.title.localeCompare(b.title));
@@ -440,23 +449,31 @@ html, body, #root {
         if (layer) { layer.url = null; sync(); }
         return;
       }
-      if (artworkCache.has(id)) {
-        if (layer) { layer.url = artworkCache.get(id); sync(); }
-        return;
-      }
 
       const entry = library.find((w) => w.id === id);
       const source = status.source;
       if (!source) return;
 
+      // A preview GIF animates; a carved scene.pkg is static but far sharper.
+      // The preference only bites where an animated preview actually exists.
+      const useAnimated = !!(prefs.preferAnimated && entry && entry.animated);
+      const cacheKey = id + (useAnimated ? '#anim' : '#still');
+
+      if (artworkCache.has(cacheKey)) {
+        if (layer) { layer.url = artworkCache.get(cacheKey); sync(); }
+        return;
+      }
+
       let url = null;
-      const pkg = await source.file(id, 'scene.pkg');
-      if (pkg) url = await extractArtwork(pkg);
-      // Video wallpapers have no scene.pkg; their preview still beats nothing.
+      if (!useAnimated) {
+        const pkg = await source.file(id, 'scene.pkg');
+        if (pkg) url = await extractArtwork(pkg);
+      }
+      // Fall back to the preview — for video wallpapers it is all there is.
       if (!url && entry && entry.thumb) url = entry.thumb;
       if (!url) return;
 
-      artworkCache.set(id, url);
+      artworkCache.set(cacheKey, url);
       if (layer) { layer.url = url; sync(); }
       emit();
     }
@@ -645,6 +662,24 @@ html, body, #root {
             style: { fontSize: '12px', color: 'var(--dsw-alias-label-tertiary)', minWidth: 0 },
           }, status.source ? status.source.name : '例如 …\\workshop\\content\\431960')),
 
+        /* animated previews: sharper still vs moving GIF */
+        h(Row, null,
+          h(Label, null, '动态壁纸'),
+          h(Button, {
+            onClick: () => {
+              const next = !cur.preferAnimated;
+              update({ preferAnimated: next });
+              if (cur.wallpaper) applyWallpaper(cur.wallpaper);
+            },
+          }, cur.preferAnimated ? '优先动图' : '优先高清'),
+          h('span', {
+            style: { fontSize: '12px', color: 'var(--dsw-alias-label-tertiary)', minWidth: 0 },
+          }, (function () {
+            const n = library.filter((w) => w.animated).length;
+            if (library.length === 0) return '选择文件夹后可用';
+            return n + ' 张有动图预览' + (cur.preferAnimated ? '' : '，其余取 scene.pkg 高清原图');
+          })())),
+
         /* sliders */
         h(Row, null, h(Label, null, '面板透明度'),
           h(Slider, {
@@ -709,6 +744,7 @@ html, body, #root {
                 borderRadius: 'var(--dsw-radius-md, 10px)',
                 background: 'transparent', padding: '4px', cursor: 'pointer',
                 display: 'flex', flexDirection: 'column', gap: '6px', alignItems: 'center',
+                position: 'relative',
               },
             },
               w.thumb ? h('img', {
@@ -723,6 +759,13 @@ html, body, #root {
                   background: 'var(--dsw-alias-bg-layer-2)',
                 },
               }),
+              w.animated ? h('span', {
+                style: {
+                  position: 'absolute', top: '8px', right: '8px',
+                  fontSize: '10px', lineHeight: '14px', padding: '0 5px',
+                  borderRadius: '5px', background: 'rgba(0,0,0,0.6)', color: '#fff',
+                },
+              }, '动') : null,
               h('span', {
                 style: {
                   fontSize: '11px', lineHeight: '14px', maxWidth: '100%',
