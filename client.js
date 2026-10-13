@@ -199,6 +199,31 @@ window.__ModuleLoader__.load({
       });
     }
 
+    /**
+     * First frame of an animated image, as a static JPEG blob URL.
+     * A picker holding dozens of simultaneously animating GIFs keeps the
+     * decoder busy and makes the one wallpaper on the background layer stutter,
+     * so the grid shows a still and only the wallpaper animates.
+     */
+    async function stillFromImage(blob) {
+      try {
+        const bitmap = await createImageBitmap(blob);
+        const canvas = document.createElement('canvas');
+        canvas.width = bitmap.width;
+        canvas.height = bitmap.height;
+        canvas.getContext('2d').drawImage(bitmap, 0, 0);
+        if (bitmap.close) bitmap.close();
+        return await new Promise((resolve) => {
+          canvas.toBlob((out) => {
+            resolve(out ? URL.createObjectURL(out) : null);
+          }, 'image/jpeg', 0.82);
+        });
+      } catch (e) {
+        // No createImageBitmap / toBlob: fall back to the animated URL.
+        return null;
+      }
+    }
+
     /* ── library sources ────────────────────────────────────────────── */
 
     /**
@@ -277,18 +302,23 @@ window.__ModuleLoader__.load({
         }
 
         let thumb = null;
+        let anim = null;
+        let animated = false;
         if (previewName) {
           const pf = await source.file(id, previewName);
-          if (pf) thumb = URL.createObjectURL(pf);
+          if (pf) {
+            anim = URL.createObjectURL(pf);
+            if (previewName === 'preview.gif') {
+              animated = true;
+              // Grid shows a still; only the background layer animates.
+              thumb = (await stillFromImage(pf)) || anim;
+            } else {
+              thumb = anim;
+            }
+          }
         }
 
-        out.push({
-          id,
-          title,
-          type,
-          thumb,
-          animated: previewName === 'preview.gif',
-        });
+        out.push({ id, title, type, thumb, anim, animated });
         if (onProgress && i % 8 === 0) onProgress(i + 1, dirs.length);
       }
       out.sort((a, b) => a.title.localeCompare(b.title));
@@ -363,8 +393,11 @@ html, body, #root {
 
       const img = document.createElement('div');
       img.setAttribute('data-wpe', 'image');
+      // `will-change` keeps the layer composited on the GPU, which stops an
+      // animated source from occasionally re-rasterizing into a blank frame.
       img.style.cssText =
-        'position:absolute;inset:0;background-size:cover;background-position:center';
+        'position:absolute;inset:0;background-size:cover;background-position:center;' +
+        'will-change:transform';
 
       const dim = document.createElement('div');
       dim.setAttribute('data-wpe', 'dim');
@@ -473,14 +506,19 @@ html, body, #root {
         return;
       }
 
-      const thumbUrl = entry ? entry.thumb : null;
+      // The animated URL is the moving one; the still (its first frame) is what
+      // the picker displays, so it doubles as a safe non-animated candidate.
+      const animUrl = entry ? (entry.anim || null) : null;
+      const stillUrl = entry ? (entry.thumb || null) : null;
+      const wantUrl = useAnimated ? (animUrl || stillUrl) : stillUrl;
+
       const candidates = [];
       if (!useAnimated) {
         const pkg = await source.file(id, 'scene.pkg');
         if (pkg) candidates.push.apply(candidates, await extractTextures(pkg));
       }
-      if (thumbUrl) {
-        const m = await measureUrl(thumbUrl);
+      if (wantUrl) {
+        const m = await measureUrl(wantUrl);
         if (m) candidates.push(m);
       }
 
@@ -489,8 +527,8 @@ html, body, #root {
       // sprites. Whichever is picked, the resolution is recorded so the UI can
       // be honest about how much upscaling a wallpaper needs.
       let pick = null;
-      if (useAnimated && thumbUrl) {
-        pick = candidates.find((c) => c.url === thumbUrl) || null;
+      if (useAnimated && wantUrl) {
+        pick = candidates.find((c) => c.url === wantUrl) || candidates[0] || null;
       }
       if (!pick) {
         const ranked = candidates.slice().sort((a, b) => b.w * b.h - a.w * a.h);
@@ -498,9 +536,13 @@ html, body, #root {
       }
       if (!pick) return;
 
+      // Never revoke a URL the picker is still displaying.
+      const keep = new Set();
+      if (animUrl) keep.add(animUrl);
+      if (stillUrl) keep.add(stillUrl);
+      keep.add(pick.url);
       for (let i = 0; i < candidates.length; i += 1) {
-        const c = candidates[i];
-        if (c !== pick && c.url !== thumbUrl) URL.revokeObjectURL(c.url);
+        if (!keep.has(candidates[i].url)) URL.revokeObjectURL(candidates[i].url);
       }
 
       artworkCache.set(cacheKey, pick.url);
@@ -515,6 +557,14 @@ html, body, #root {
     }
 
     async function adoptSource(source) {
+      // Drop the previous library's object URLs before replacing it, or a
+      // rescan leaks one blob per wallpaper.
+      library.forEach((w) => {
+        if (w.thumb) URL.revokeObjectURL(w.thumb);
+        if (w.anim && w.anim !== w.thumb) URL.revokeObjectURL(w.anim);
+      });
+      library = [];
+
       status = { ...status, scanning: true, source, message: '', done: 0, total: 0 };
       emit();
       try {
@@ -907,7 +957,10 @@ html, body, #root {
             clearInterval(timer);
             disposeCss();
             if (disposeTokens) { disposeTokens(); disposeTokens = null; }
-            library.forEach((w) => { if (w.thumb) URL.revokeObjectURL(w.thumb); });
+            library.forEach((w) => {
+              if (w.thumb) URL.revokeObjectURL(w.thumb);
+              if (w.anim && w.anim !== w.thumb) URL.revokeObjectURL(w.anim);
+            });
             artworkCache.forEach((url) => URL.revokeObjectURL(url));
             artworkCache.clear();
             if (layer && layer.root.parentNode) layer.root.parentNode.removeChild(layer.root);
