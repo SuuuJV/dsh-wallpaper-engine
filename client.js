@@ -10,8 +10,11 @@
  *
  * The user grants access to their Wallpaper Engine workshop folder through the
  * browser's directory picker; titles come from each project.json, thumbnails
- * from each preview image, and full-resolution artwork is carved out of
- * scene.pkg by scanning for embedded JPEG/PNG streams.
+ * from each preview image, and the artwork is *composited* out of scene.pkg:
+ * a scene is a stack of texture layers that Wallpaper Engine blends at runtime,
+ * so the picture only exists once the stack is rendered (see the scene renderer
+ * below). Wallpapers without a scene.pkg — video and web ones — use their
+ * preview image, which is all they ship.
  */
 
 window.__ModuleLoader__.load({
@@ -41,16 +44,7 @@ window.__ModuleLoader__.load({
     const PREVIEW_NAMES = ['preview.jpg', 'preview.jpeg', 'preview.png', 'preview.gif', 'preview.webp'];
 
     const JPEG_SOI = [0xff, 0xd8, 0xff];
-    const JPEG_EOI = [0xff, 0xd9];
     const PNG_SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-    const PNG_END = [0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82];
-    // At or above this, an embedded scene.pkg texture is clearly the better
-    // source — sharp enough to be worth giving up an animation for.
-    const HIGH_RES_WIDTH = 1280;
-    // Minimum luminance contrast for a candidate to count as artwork rather
-    // than an effect mask or a blank frame. Real artwork scored 41-79 in this
-    // library, masks 0-16.
-    const MIN_DETAIL = 20;
 
     /* ── small utilities ────────────────────────────────────────────── */
 
@@ -121,120 +115,781 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /* ── scene.pkg: recover the embedded artwork ────────────────────── */
+    /* ── scene.pkg: composite the scene ─────────────────────────────── */
 
-    /** Byte offsets of every `sig … endSig` span in `bytes`. */
-    function findSpans(bytes, sig, endSig) {
-      const spans = [];
-      const n = bytes.length;
-      const sn = sig.length;
-      const en = endSig.length;
-      let i = 0;
-      while (i < n) {
-        let start = -1;
-        for (let j = i; j <= n - sn; j += 1) {
-          let ok = true;
-          for (let k = 0; k < sn; k += 1) {
-            if (bytes[j + k] !== sig[k]) { ok = false; break; }
-          }
-          if (ok) { start = j; break; }
-        }
-        if (start < 0) break;
-        let end = -1;
-        for (let j = start + sn; j <= n - en; j += 1) {
-          let ok = true;
-          for (let k = 0; k < en; k += 1) {
-            if (bytes[j + k] !== endSig[k]) { ok = false; break; }
-          }
-          if (ok) { end = j; break; }
-        }
-        if (end < 0) break;
-        spans.push([start, end + en]);
-        i = end + en;
-      }
-      return spans;
+    /* #region scene-renderer */
+
+    /**
+     * A scene.pkg is a PKGV container:
+     *
+     *   "PKGV0011" [int32 file count]
+     *   per file: [int32 name length][name utf8][int32 offset][int32 size]
+     *   <data section>      every offset is relative to its start
+     *
+     * scene.json lists the objects in draw order, and every image object points
+     * at models/<x>.json → materials/<x>.json → materials/<x>.tex. The order
+     * matters: a scene is a *stack of layers* that Wallpaper Engine composites
+     * at runtime, so lifting one texture out of the package hands back a single
+     * layer of the picture. For 2372608028 that layer was a nearly empty atlas,
+     * which is why the background did not look like the original artwork. The
+     * code below renders the stack instead.
+     *
+     * A .tex is a TEXV0005 container holding a TEXB blob:
+     *
+     *   "TEXB00NN" + NN header ints (the last one is the mip count)
+     *   per mip: [w][h][lz4?][raw size][stored size][data]
+     *
+     * Each mip is either a stored PNG/JPEG stream or raw pixels — RGBA8888,
+     * DXT5, DXT1 or a single channel mask — LZ4-compressed when its flag says
+     * so. Roughly half of this library's artwork is in the raw flavours, where
+     * a magic-byte scan finds nothing at all.
+     */
+
+    // Composited at this width; a 4K scene is not worth decoding twice over.
+    const SCENE_WIDTH = 1920;
+    // Luminance standard deviation below which a composite is an empty frame
+    // rather than a picture (a scene whose only content is a mesh or a
+    // script-driven layer renders to a flat colour).
+    const FLAT_STD = 4;
+
+    function utf8(bytes, start, len) {
+      return new TextDecoder('utf-8').decode(bytes.subarray(start, start + len));
     }
 
-    function measure(blob) {
-      return new Promise((resolve) => {
+    function indexOfBytes(hay, needle, from) {
+      const n = hay.length;
+      const m = needle.length;
+      for (let i = from || 0; i + m <= n; i += 1) {
+        let ok = true;
+        for (let k = 0; k < m; k += 1) {
+          if (hay[i + k] !== needle.charCodeAt(k)) { ok = false; break; }
+        }
+        if (ok) return i;
+      }
+      return -1;
+    }
+
+    function startsWithBytes(bytes, sig, at) {
+      for (let k = 0; k < sig.length; k += 1) {
+        if (bytes[(at || 0) + k] !== sig[k]) return false;
+      }
+      return true;
+    }
+
+    function viewOf(bytes) {
+      return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    }
+
+    /** Parse the PKGV file table of a scene.pkg. */
+    function readPkg(bytes) {
+      const dv = viewOf(bytes);
+      const count = dv.getInt32(12, true);
+      let pos = 16;
+      const entries = new Map();
+      for (let i = 0; i < count && pos + 12 <= bytes.length; i += 1) {
+        const nameLen = dv.getInt32(pos, true);
+        pos += 4;
+        if (nameLen < 0 || pos + nameLen + 8 > bytes.length) break;
+        const name = utf8(bytes, pos, nameLen);
+        pos += nameLen;
+        const off = dv.getInt32(pos, true);
+        const size = dv.getInt32(pos + 4, true);
+        pos += 8;
+        if (off < 0 || size < 0) break;
+        entries.set(name, [off, size]);
+      }
+      return { bytes, entries, dataStart: pos };
+    }
+
+    function pkgMember(pkg, name) {
+      const e = pkg.entries.get(name);
+      if (!e) return null;
+      const start = pkg.dataStart + e[0];
+      if (start + e[1] > pkg.bytes.length) return null;
+      return pkg.bytes.subarray(start, start + e[1]);
+    }
+
+    function pkgJson(pkg, name) {
+      const m = pkgMember(pkg, name);
+      if (!m) return null;
+      try {
+        return JSON.parse(utf8(m, 0, m.length));
+      } catch (e) {
+        return null;
+      }
+    }
+
+    /** scene.json names lack the folder and extension ("dsds" → "materials/dsds.tex"). */
+    function resolveEntry(pkg, name) {
+      if (!name) return null;
+      if (pkg.entries.has(name)) return name;
+      const tries = [
+        name + '.tex',
+        'materials/' + name + '.tex',
+        'materials/' + name,
+        name + '.json',
+        'models/' + name + '.json',
+      ];
+      for (let i = 0; i < tries.length; i += 1) {
+        if (pkg.entries.has(tries[i])) return tries[i];
+      }
+      const base = String(name).split('/').pop() + '.tex';
+      const keys = pkg.entries.keys();
+      for (let k = keys.next(); !k.done; k = keys.next()) {
+        if (k.value.split('/').pop() === base) return k.value;
+      }
+      return null;
+    }
+
+    /** "x y z" → [x, y, z]; script/animation values are objects and give null. */
+    function vecValue(v, n) {
+      if (typeof v !== 'string') return null;
+      const parts = v.trim().split(/\s+/);
+      if (parts.length < n) return null;
+      const out = [];
+      for (let i = 0; i < n; i += 1) {
+        const f = parseFloat(parts[i]);
+        if (!Number.isFinite(f)) return null;
+        out.push(f);
+      }
+      return out;
+    }
+
+    function colorValue(v, fallback) {
+      const parts = typeof v === 'string' ? v.trim().split(/\s+/) : null;
+      if (!parts || parts.length < 3) return fallback;
+      const out = [];
+      for (let i = 0; i < 3; i += 1) {
+        const f = parseFloat(parts[i]);
+        out.push(Number.isFinite(f) ? Math.max(0, Math.min(1, f)) : fallback[i]);
+      }
+      return out;
+    }
+
+    /** Decode an LZ4 raw block (no frame header) into `expected` bytes. */
+    function lz4Block(src, expected) {
+      const cap = expected > 0 ? expected : Math.max(64, src.length * 4);
+      const out = new Uint8Array(cap);
+      let o = 0;
+      let i = 0;
+      const n = src.length;
+      while (i < n && o < cap) {
+        const token = src[i];
+        i += 1;
+        let literals = token >> 4;
+        if (literals === 15) {
+          let b = 255;
+          while (b === 255 && i < n) { b = src[i]; i += 1; literals += b; }
+        }
+        if (literals > 0) {
+          if (i + literals > n || o + literals > cap) break;
+          out.set(src.subarray(i, i + literals), o);
+          o += literals;
+          i += literals;
+        }
+        if (i + 2 > n || o >= cap) break;
+        const offset = src[i] | (src[i + 1] << 8);
+        i += 2;
+        if (offset === 0 || offset > o) throw new Error('bad LZ4 offset');
+        let length = token & 15;
+        if (length === 15) {
+          let b = 255;
+          while (b === 255 && i < n) { b = src[i]; i += 1; length += b; }
+        }
+        length += 4;
+        let s = o - offset;
+        if (o + length > cap) length = cap - o;
+        if (offset >= length) {
+          out.set(out.subarray(s, s + length), o);
+          o += length;
+        } else {
+          for (let k = 0; k < length; k += 1) { out[o] = out[s + k]; o += 1; }
+        }
+      }
+      return out.subarray(0, o);
+    }
+
+    function dxtPalette(c0, c1) {
+      const p = new Uint8Array(16);
+      const r0 = ((c0 >> 11) & 31) * 255 / 31;
+      const g0 = ((c0 >> 5) & 63) * 255 / 63;
+      const b0 = (c0 & 31) * 255 / 31;
+      const r1 = ((c1 >> 11) & 31) * 255 / 31;
+      const g1 = ((c1 >> 5) & 63) * 255 / 63;
+      const b1 = (c1 & 31) * 255 / 31;
+      p[0] = r0; p[1] = g0; p[2] = b0;
+      p[4] = r1; p[5] = g1; p[6] = b1;
+      if (c0 > c1) {
+        p[8] = (2 * r0 + r1) / 3; p[9] = (2 * g0 + g1) / 3; p[10] = (2 * b0 + b1) / 3;
+        p[12] = (r0 + 2 * r1) / 3; p[13] = (g0 + 2 * g1) / 3; p[14] = (b0 + 2 * b1) / 3;
+      } else {
+        p[8] = (r0 + r1) / 2; p[9] = (g0 + g1) / 2; p[10] = (b0 + b1) / 2;
+        p[12] = 0; p[13] = 0; p[14] = 0;
+      }
+      p[3] = 255; p[7] = 255; p[11] = 255; p[15] = 255;
+      return p;
+    }
+
+    /**
+     * Decode DXT1 or DXT5 blocks. `kind` is 1 or 5 — the two flavours this
+     * library uses (DXT5 whenever a texture needs eight bits of alpha).
+     */
+    function decodeDxt(raw, w, h, kind) {
+      const block = kind === 5 ? 16 : 8;
+      const bw = Math.ceil(w / 4);
+      const bh = Math.ceil(h / 4);
+      if (raw.length < bw * bh * block) return null;
+      const out = new Uint8ClampedArray(w * h * 4);
+      const alphaTable = new Uint8Array(8);
+      for (let by = 0; by < bh; by += 1) {
+        for (let bx = 0; bx < bw; bx += 1) {
+          const src = (by * bw + bx) * block;
+          let colorAt = src;
+          let a0 = 255;
+          let a1 = 255;
+          let alphaBits = 0;
+          if (kind === 5) {
+            a0 = raw[src];
+            a1 = raw[src + 1];
+            alphaBits = raw[src + 2] | (raw[src + 3] << 8) | (raw[src + 4] << 16)
+              | (raw[src + 5] << 24);
+            alphaBits >>>= 0;
+            colorAt = src + 8;
+            if (a0 > a1) {
+              for (let i = 0; i < 6; i += 1) {
+                alphaTable[i + 2] = ((6 - i) * a0 + (i + 1) * a1) / 7;
+              }
+            } else {
+              alphaTable[2] = (4 * a0 + a1) / 5;
+              alphaTable[3] = (3 * a0 + 2 * a1) / 5;
+              alphaTable[4] = (2 * a0 + 3 * a1) / 5;
+              alphaTable[5] = (a0 + 4 * a1) / 5;
+              alphaTable[6] = 0;
+              alphaTable[7] = 255;
+            }
+            alphaTable[0] = a0;
+            alphaTable[1] = a1;
+          }
+          const c0 = raw[colorAt] | (raw[colorAt + 1] << 8);
+          const c1 = raw[colorAt + 2] | (raw[colorAt + 3] << 8);
+          const palette = dxtPalette(c0, c1);
+          const bits = (raw[colorAt + 4] | (raw[colorAt + 5] << 8)
+            | (raw[colorAt + 6] << 16) | (raw[colorAt + 7] << 24)) >>> 0;
+          for (let py = 0; py < 4; py += 1) {
+            const y = by * 4 + py;
+            if (y >= h) break;
+            for (let px = 0; px < 4; px += 1) {
+              const x = bx * 4 + px;
+              if (x >= w) break;
+              const idx = py * 4 + px;
+              const ci = (bits >> (2 * idx)) & 3;
+              const dst = (y * w + x) * 4;
+              out[dst] = palette[ci * 4];
+              out[dst + 1] = palette[ci * 4 + 1];
+              out[dst + 2] = palette[ci * 4 + 2];
+              if (kind === 5) {
+                const shift = 3 * idx;
+                const ai = (alphaBits >>> shift) & 7;
+                out[dst + 3] = alphaTable[ai];
+              } else {
+                out[dst + 3] = c0 > c1 || ci !== 3 ? 255 : 0;
+              }
+            }
+          }
+        }
+      }
+      return { data: out, w: w, h: h };
+    }
+
+    /** Interpret decompressed mip bytes using the container's format field. */
+    function rawPixels(raw, w, h, fmt) {
+      if (!raw || !raw.length || w < 1 || h < 1) return null;
+      const per = raw.length / (w * h);
+      if (per > 2.5) {
+        if (raw.length >= w * h * 4) {
+          return { data: new Uint8ClampedArray(raw.buffer, raw.byteOffset, w * h * 4), w: w, h: h };
+        }
+        if (raw.length >= w * h * 3) {
+          const out = new Uint8ClampedArray(w * h * 4);
+          for (let i = 0; i < w * h; i += 1) {
+            out[i * 4] = raw[i * 3];
+            out[i * 4 + 1] = raw[i * 3 + 1];
+            out[i * 4 + 2] = raw[i * 3 + 2];
+            out[i * 4 + 3] = 255;
+          }
+          return { data: out, w: w, h: h };
+        }
+      } else if (per > 0.9) {
+        if (fmt === 1 || fmt === 4) {          // DXT5 also spends one byte per pixel
+          const dxt = decodeDxt(raw, w, h, 5);
+          if (dxt) return dxt;
+        }
+        if (raw.length >= w * h) {             // single channel mask
+          const out = new Uint8ClampedArray(w * h * 4);
+          for (let i = 0; i < w * h; i += 1) {
+            out[i * 4] = raw[i];
+            out[i * 4 + 1] = raw[i];
+            out[i * 4 + 2] = raw[i];
+            out[i * 4 + 3] = 255;
+          }
+          return { data: out, w: w, h: h };
+        }
+      } else if (per > 0.45) {
+        return decodeDxt(raw, w, h, 1);
+      }
+      return null;
+    }
+
+    /** Header of a TEXV0005 container plus its TEXB mip table. */
+    function readTex(bytes) {
+      const dv = viewOf(bytes);
+      const fmt = bytes.length >= 22 ? dv.getInt32(18, true) : 0;
+      const dims = bytes.length >= 42 ? {
+        texW: dv.getInt32(26, true),
+        texH: dv.getInt32(30, true),
+        imgW: dv.getInt32(34, true),
+        imgH: dv.getInt32(38, true),
+      } : { texW: 0, texH: 0, imgW: 0, imgH: 0 };
+
+      const versions = [2, 3, 4, 5];
+      for (let v = 0; v < versions.length; v += 1) {
+        const ver = versions[v];
+        const start = indexOfBytes(bytes, 'TEXB000' + ver, 40);
+        if (start < 0) continue;
+        const headerAt = start + 9;
+        const mips = dv.getInt32(headerAt + 4 * (ver - 1), true);
+        let pos = headerAt + 4 * ver;
+        if (!(mips > 0) || mips > 64) return { fmt: fmt, dims: dims, mips: [] };
+        const list = [];
+        for (let i = 0; i < mips; i += 1) {
+          if (pos + 20 > bytes.length) break;
+          const w = dv.getInt32(pos, true);
+          const h = dv.getInt32(pos + 4, true);
+          const lz4 = dv.getInt32(pos + 8, true) === 1;
+          const rawSize = dv.getInt32(pos + 12, true);
+          const size = dv.getInt32(pos + 16, true);
+          pos += 20;
+          if (w < 4 || h < 4 || size <= 0 || pos + size > bytes.length) break;
+          list.push({ w: w, h: h, lz4: lz4, rawSize: rawSize, off: pos, size: size });
+          pos += size;
+        }
+        return { fmt: fmt, dims: dims, mips: list };
+      }
+      return { fmt: fmt, dims: dims, mips: [] };
+    }
+
+    /** Raw mips hold the padded power-of-two texture; cut the padding back off. */
+    function cropToImage(px, tex, mip) {
+      const d = tex.dims;
+      if (!(d.texW > 0 && d.texH > 0 && d.imgW > 0 && d.imgH > 0)) return px;
+      const cw = Math.round(d.imgW * mip.w / d.texW);
+      const ch = Math.round(d.imgH * mip.h / d.texH);
+      if (!(cw > 0 && ch > 0) || (cw >= px.w && ch >= px.h)) return px;
+      const out = new Uint8ClampedArray(cw * ch * 4);
+      for (let y = 0; y < ch; y += 1) {
+        out.set(px.data.subarray(y * px.w * 4, (y * px.w + cw) * 4), y * cw * 4);
+      }
+      return { data: out, w: cw, h: ch };
+    }
+
+    function bitmapOf(blob) {
+      if (typeof createImageBitmap === 'function') return createImageBitmap(blob);
+      return new Promise((resolve, reject) => {
         const url = URL.createObjectURL(blob);
         const im = new Image();
-        im.onload = () => resolve({ w: im.naturalWidth, h: im.naturalHeight, url });
-        im.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
+        im.onload = () => { URL.revokeObjectURL(url); resolve(im); };
+        im.onerror = () => { URL.revokeObjectURL(url); reject(new Error('decode failed')); };
         im.src = url;
       });
     }
 
+    /** Pixels of one texture, preferring a mip close to the output size. */
+    async function texPixels(pkg, texName, minMipWidth) {
+      const blob = pkgMember(pkg, texName);
+      if (!blob || blob.length < 42) return null;
+      const tex = readTex(blob);
+      if (!tex.mips.length) return null;
+
+      // Mip 0 comes first, so walking backwards finds the smallest mip that is
+      // still at least as wide as the output: no point decoding 4K for 1920px.
+      let pick = tex.mips[0];
+      if (minMipWidth > 0) {
+        for (let i = tex.mips.length - 1; i >= 0; i -= 1) {
+          if (tex.mips[i].w >= minMipWidth) { pick = tex.mips[i]; break; }
+        }
+      }
+      const data = blob.subarray(pick.off, pick.off + pick.size);
+
+      if (startsWithBytes(data, PNG_SIG, 0) || startsWithBytes(data, JPEG_SOI, 0)) {
+        // Stored image stream: let the browser decode it, then read it back so
+        // every layer takes the same compositing path.
+        let bmp;
+        try {
+          bmp = await bitmapOf(new Blob([data]));
+        } catch (e) {
+          return null;
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = bmp.width || bmp.naturalWidth;
+        canvas.height = bmp.height || bmp.naturalHeight;
+        const g = canvas.getContext('2d', { willReadFrequently: true });
+        g.drawImage(bmp, 0, 0);
+        if (bmp.close) bmp.close();
+        if (!(canvas.width > 0 && canvas.height > 0)) return null;
+        const img = g.getImageData(0, 0, canvas.width, canvas.height);
+        return { data: img.data, w: canvas.width, h: canvas.height };
+      }
+
+      let raw = data;
+      if (pick.lz4) {
+        try {
+          raw = lz4Block(data, pick.rawSize);
+        } catch (e) {
+          return null;
+        }
+      }
+      if (raw.length && (startsWithBytes(raw, PNG_SIG, 0) || startsWithBytes(raw, JPEG_SOI, 0))) {
+        return null;      // a stream we could not identify: do not treat it as pixels
+      }
+      const px = rawPixels(raw, pick.w, pick.h, tex.fmt);
+      if (!px) return null;
+      return cropToImage(px, tex, pick);
+    }
+
+    /** One image object of a scene, as a drawable layer. */
+    async function layerOf(pkg, obj, scale, minMipWidth, canvasH) {
+      const modelKey = resolveEntry(pkg, obj.image);
+      if (!modelKey || modelKey.slice(-5) !== '.json') return null;
+      const model = pkgJson(pkg, modelKey);
+      if (!model || model.puppet) return null;         // mesh: needs a rasteriser
+      const matKey = resolveEntry(pkg, model.material);
+      if (!matKey) return null;
+      const material = pkgJson(pkg, matKey);
+      if (!material) return null;
+
+      let texName = null;
+      let sheet = false;
+      const passes = material.passes || [];
+      for (let i = 0; i < passes.length && !texName; i += 1) {
+        // A sprite sheet is an animation atlas: drawing the whole thing in the
+        // object's rectangle shows every frame at once, so it is not a still
+        // layer at all. Such objects are the falling sprites in a scene whose
+        // real picture is elsewhere.
+        if (passes[i].combos && passes[i].combos.SPRITESHEET) sheet = true;
+        const textures = passes[i].textures || [];
+        for (let k = 0; k < textures.length; k += 1) {
+          if (textures[k]) { texName = resolveEntry(pkg, textures[k]); break; }
+        }
+      }
+      if (!texName || sheet) return null;
+
+      const size = vecValue(obj.size, 2);
+      if (!size) return null;                          // script-driven size
+      const scl = vecValue(obj.scale, 2) || [1, 1];
+      const origin = vecValue(obj.origin, 2) || [0, 0];
+      const px = await texPixels(pkg, texName, minMipWidth);
+      if (!px) return null;
+
+      const dw = Math.max(1, Math.round(size[0] * scl[0] * scale));
+      const dh = Math.max(1, Math.round(size[1] * scl[1] * scale));
+      if (dw < 4 || dh < 4) return null;
+      const alpha = typeof obj.alpha === 'number' ? obj.alpha : 1;
+      return {
+        px: px,
+        // Scene Y points up while image Y points down.
+        x: (origin[0] - size[0] * scl[0] / 2) * scale,
+        y: canvasH - (origin[1] - size[1] * scl[1] / 2) * scale - dh,
+        dw: dw,
+        dh: dh,
+        alpha: alpha,
+      };
+    }
+
+    /** Source-over blend of one layer into an RGB buffer, with bilinear scaling. */
+    function blitLayer(out, W, H, L) {
+      const sw = L.px.w;
+      const sh = L.px.h;
+      const src = L.px.data;
+      const x0 = Math.max(0, Math.floor(L.x));
+      const y0 = Math.max(0, Math.floor(L.y));
+      const x1 = Math.min(W, Math.ceil(L.x + L.dw));
+      const y1 = Math.min(H, Math.ceil(L.y + L.dh));
+      if (x1 <= x0 || y1 <= y0) return;
+
+      const exact = L.dw === sw && L.dh === sh
+        && L.x === Math.round(L.x) && L.y === Math.round(L.y);
+      const aMul = Math.max(0, Math.min(1, L.alpha));
+
+      if (exact && aMul === 1) {
+        for (let y = y0; y < y1; y += 1) {
+          const sy = y - L.y;
+          for (let x = x0; x < x1; x += 1) {
+            const s = (sy * sw + (x - L.x)) * 4;
+            const a = src[s + 3];
+            if (a === 0) continue;
+            const d = (y * W + x) * 3;
+            if (a === 255) {
+              out[d] = src[s];
+              out[d + 1] = src[s + 1];
+              out[d + 2] = src[s + 2];
+            } else {
+              const f = a / 255;
+              const g = 1 - f;
+              out[d] = src[s] * f + out[d] * g;
+              out[d + 1] = src[s + 1] * f + out[d + 1] * g;
+              out[d + 2] = src[s + 2] * f + out[d + 2] * g;
+            }
+          }
+        }
+        return;
+      }
+
+      const kx = sw / L.dw;
+      const ky = sh / L.dh;
+      for (let y = y0; y < y1; y += 1) {
+        const fy = Math.max(0, Math.min(sh - 1, (y + 0.5 - L.y) * ky - 0.5));
+        const y0i = Math.floor(fy);
+        const y1i = Math.min(sh - 1, y0i + 1);
+        const wy = fy - y0i;
+        for (let x = x0; x < x1; x += 1) {
+          const fx = Math.max(0, Math.min(sw - 1, (x + 0.5 - L.x) * kx - 0.5));
+          const x0i = Math.floor(fx);
+          const x1i = Math.min(sw - 1, x0i + 1);
+          const wx = fx - x0i;
+          const i00 = (y0i * sw + x0i) * 4;
+          const i10 = (y0i * sw + x1i) * 4;
+          const i01 = (y1i * sw + x0i) * 4;
+          const i11 = (y1i * sw + x1i) * 4;
+          const w00 = (1 - wx) * (1 - wy);
+          const w10 = wx * (1 - wy);
+          const w01 = (1 - wx) * wy;
+          const w11 = wx * wy;
+          const a = (src[i00 + 3] * w00 + src[i10 + 3] * w10
+            + src[i01 + 3] * w01 + src[i11 + 3] * w11) * aMul;
+          if (a < 1) continue;
+          const r = src[i00] * w00 + src[i10] * w10 + src[i01] * w01 + src[i11] * w11;
+          const g = src[i00 + 1] * w00 + src[i10 + 1] * w10
+            + src[i01 + 1] * w01 + src[i11 + 1] * w11;
+          const b = src[i00 + 2] * w00 + src[i10 + 2] * w10
+            + src[i01 + 2] * w01 + src[i11 + 2] * w11;
+          const d = (y * W + x) * 3;
+          if (a >= 254) {
+            out[d] = r;
+            out[d + 1] = g;
+            out[d + 2] = b;
+          } else {
+            const f = a / 255;
+            const inv = 1 - f;
+            out[d] = r * f + out[d] * inv;
+            out[d + 1] = g * f + out[d + 1] * inv;
+            out[d + 2] = b * f + out[d + 2] * inv;
+          }
+        }
+      }
+    }
+
+    /** Fraction of the frame taken by a puppet (mesh) object, 0 if none. */
+    function puppetFraction(pkg, scene) {
+      const ortho = (scene.general || {}).orthogonalprojection || {};
+      const area = (ortho.width || 0) * (ortho.height || 0);
+      if (!(area > 0)) return 0;
+      let best = 0;
+      const objects = scene.objects || [];
+      for (let i = 0; i < objects.length; i += 1) {
+        const obj = objects[i];
+        if (!obj.image) continue;
+        const key = resolveEntry(pkg, obj.image);
+        if (!key || key.slice(-5) !== '.json') continue;
+        const model = pkgJson(pkg, key);
+        if (!model || !model.puppet) continue;
+        const size = vecValue(obj.size, 2);
+        if (!size) continue;
+        const scl = vecValue(obj.scale, 2) || [1, 1];
+        best = Math.max(best, size[0] * scl[0] * size[1] * scl[1] / area);
+      }
+      return best;
+    }
+
     /**
-     * Every decodable image embedded in a scene.pkg, largest first.
-     * scene.pkg stores its textures as plain JPEG/PNG streams, so a magic-byte
-     * scan recovers them.
+     * Average an RGBA buffer down to a small grid. Averaging (rather than
+     * point sampling) is what makes the dominant-colour tests below stable:
+     * noise averages away, so a picture reads as a picture.
      */
-    async function extractTextures(pkgFile) {
+    function downsampled(rgba, w, h, gw, gh) {
+      const out = new Uint8ClampedArray(gw * gh * 3);
+      for (let gy = 0; gy < gh; gy += 1) {
+        const y0 = Math.min(h - 1, Math.floor(gy * h / gh));
+        const y1 = Math.max(y0 + 1, Math.min(h, Math.floor((gy + 1) * h / gh)));
+        for (let gx = 0; gx < gw; gx += 1) {
+          const x0 = Math.min(w - 1, Math.floor(gx * w / gw));
+          const x1 = Math.max(x0 + 1, Math.min(w, Math.floor((gx + 1) * w / gw)));
+          let r = 0;
+          let g = 0;
+          let b = 0;
+          let n = 0;
+          for (let y = y0; y < y1; y += 1) {
+            for (let x = x0; x < x1; x += 1) {
+              const s = (y * w + x) * 4;
+              r += rgba[s];
+              g += rgba[s + 1];
+              b += rgba[s + 2];
+              n += 1;
+            }
+          }
+          const d = (gy * gw + gx) * 3;
+          out[d] = r / n;
+          out[d + 1] = g / n;
+          out[d + 2] = b / n;
+        }
+      }
+      return out;
+    }
+
+    /** Share of the picture that is not its dominant colour. */
+    function contentFraction(rgba, w, h) {
+      const gw = 160;
+      const gh = 90;
+      const small = downsampled(rgba, w, h, gw, gh);
+      const counts = new Map();
+      let mode = 0;
+      let modeCount = 0;
+      for (let i = 0; i < gw * gh; i += 1) {
+        const key = (small[i * 3] << 16) | (small[i * 3 + 1] << 8) | small[i * 3 + 2];
+        const n = (counts.get(key) || 0) + 1;
+        counts.set(key, n);
+        if (n > modeCount) { modeCount = n; mode = key; }
+      }
+      const mr = (mode >> 16) & 255;
+      const mg = (mode >> 8) & 255;
+      const mb = mode & 255;
+      let diff = 0;
+      for (let i = 0; i < gw * gh; i += 1) {
+        if (Math.abs(small[i * 3] - mr) + Math.abs(small[i * 3 + 1] - mg)
+          + Math.abs(small[i * 3 + 2] - mb) > 24) diff += 1;
+      }
+      return diff / (gw * gh);
+    }
+
+    /** Luminance standard deviation of a composite, on a 64x64 reduction. */
+    function flatness(rgba, w, h) {
+      const n = 64;
+      const small = downsampled(rgba, w, h, n, n);
+      let sum = 0;
+      let sumSq = 0;
+      for (let i = 0; i < n * n; i += 1) {
+        const lum = 0.299 * small[i * 3] + 0.587 * small[i * 3 + 1] + 0.114 * small[i * 3 + 2];
+        sum += lum;
+        sumSq += lum * lum;
+      }
+      const mean = sum / (n * n);
+      return Math.sqrt(Math.max(0, sumSq / (n * n) - mean * mean));
+    }
+
+    /**
+     * Composite every still layer of a scene.pkg. Returns an object URL plus the
+     * pixel buffer (the quality checks need the pixels, not the URL).
+     */
+    async function renderScene(pkgFile) {
       let bytes;
       try {
         bytes = new Uint8Array(await pkgFile.arrayBuffer());
       } catch (e) {
-        return [];
+        return null;
+      }
+      let pkg;
+      let scene;
+      try {
+        pkg = readPkg(bytes);
+        scene = pkgJson(pkg, 'scene.json');
+      } catch (e) {
+        return null;
+      }
+      if (!scene || !scene.objects) return null;
+
+      const general = scene.general || {};
+      const ortho = general.orthogonalprojection || {};
+      let ow = Math.round(ortho.width || 0);
+      let oh = Math.round(ortho.height || 0);
+      if (!(ow > 0 && oh > 0)) {
+        const objects = scene.objects;
+        for (let i = 0; i < objects.length; i += 1) {
+          const size = vecValue(objects[i].size, 2);
+          const origin = vecValue(objects[i].origin, 2);
+          if (!size || !origin) continue;
+          ow = Math.max(ow, Math.round(origin[0] + size[0] / 2));
+          oh = Math.max(oh, Math.round(origin[1] + size[1] / 2));
+        }
+      }
+      if (!(ow > 0 && oh > 0)) return null;
+
+      const scale = ow > SCENE_WIDTH ? SCENE_WIDTH / ow : 1;
+      const W = Math.max(1, Math.round(ow * scale));
+      const H = Math.max(1, Math.round(oh * scale));
+      const minMip = scale < 1 ? W : 0;
+
+      const layers = [];
+      for (let i = 0; i < scene.objects.length; i += 1) {
+        const obj = scene.objects[i];
+        if (obj.visible === false || !obj.image) continue;
+        let L = null;
+        try {
+          L = await layerOf(pkg, obj, scale, minMip, H);
+        } catch (e) {
+          L = null;
+        }
+        if (L) layers.push(L);
+        // Decoding a 4K layer takes a moment; hand the frame back to the UI
+        // every few layers so the window never looks frozen.
+        if (i % 4 === 3) await new Promise((resolve) => { setTimeout(resolve, 0); });
+      }
+      if (!layers.length) return null;
+
+      const clear = colorValue(general.clearcolor, [0.7, 0.7, 0.7]);
+      const out = new Uint8ClampedArray(W * H * 3);
+      const cr = Math.round(clear[0] * 255);
+      const cg = Math.round(clear[1] * 255);
+      const cb = Math.round(clear[2] * 255);
+      for (let i = 0; i < W * H; i += 1) {
+        out[i * 3] = cr;
+        out[i * 3 + 1] = cg;
+        out[i * 3 + 2] = cb;
+      }
+      for (let i = 0; i < layers.length; i += 1) blitLayer(out, W, H, layers[i]);
+
+      const rgba = new Uint8ClampedArray(W * H * 4);
+      for (let i = 0; i < W * H; i += 1) {
+        rgba[i * 4] = out[i * 3];
+        rgba[i * 4 + 1] = out[i * 3 + 1];
+        rgba[i * 4 + 2] = out[i * 3 + 2];
+        rgba[i * 4 + 3] = 255;
       }
 
-      const spans = []
-        .concat(findSpans(bytes, JPEG_SOI, JPEG_EOI))
-        .concat(findSpans(bytes, PNG_SIG, PNG_END));
+      const canvas = document.createElement('canvas');
+      canvas.width = W;
+      canvas.height = H;
+      canvas.getContext('2d').putImageData(new ImageData(rgba, W, H), 0, 0);
+      const blob = await new Promise((resolve) => {
+        canvas.toBlob(resolve, 'image/jpeg', 0.9);
+      });
+      if (!blob) return null;
 
-      const out = [];
-      for (let i = 0; i < spans.length; i += 1) {
-        const span = spans[i];
-        const info = await measure(new Blob([bytes.subarray(span[0], span[1])]));
-        if (info) out.push(info);
-      }
-      out.sort((a, b) => b.w * b.h - a.w * a.h);
-      return out;
+      return {
+        url: URL.createObjectURL(blob),
+        w: W,
+        h: H,
+        layers: layers.length,
+        rgba: rgba,
+        puppet: puppetFraction(pkg, scene),
+      };
     }
+
+    /* #endregion scene-renderer */
 
     /** Size of an image URL that already exists (a preview Blob URL, say). */
     function measureUrl(url) {
       return new Promise((resolve) => {
         const im = new Image();
         im.onload = () => resolve({ url, w: im.naturalWidth, h: im.naturalHeight });
-        im.onerror = () => resolve(null);
-        im.src = url;
-      });
-    }
-
-    /**
-     * Luminance standard deviation of an image, measured on a 64x64 reduction.
-     * A scene.pkg keeps effect and mask textures beside the artwork — often at
-     * the *exact same pixel size* — so area alone cannot tell them apart. In a
-     * survey of this library every real artwork scored 41-79 while masks and
-     * blank frames scored 0-16, so contrast is the discriminator.
-     */
-    function detailScore(url) {
-      return new Promise((resolve) => {
-        const im = new Image();
-        im.onload = () => {
-          try {
-            const N = 64;
-            const canvas = document.createElement('canvas');
-            canvas.width = N;
-            canvas.height = N;
-            const g = canvas.getContext('2d', { willReadFrequently: true });
-            g.drawImage(im, 0, 0, N, N);
-            const d = g.getImageData(0, 0, N, N).data;
-            let sum = 0;
-            let sumSq = 0;
-            const n = d.length / 4;
-            for (let i = 0; i < d.length; i += 4) {
-              const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-              sum += lum;
-              sumSq += lum * lum;
-            }
-            const mean = sum / n;
-            resolve(Math.sqrt(Math.max(0, sumSq / n - mean * mean)));
-          } catch (e) {
-            resolve(null);
-          }
-        };
         im.onerror = () => resolve(null);
         im.src = url;
       });
@@ -545,7 +1200,7 @@ html, body, #root {
       const source = status.source;
       if (!source) return;
 
-      // A preview GIF animates; a carved scene.pkg is static but far sharper.
+      // A preview GIF animates; a composited scene is static but far sharper.
       // The preference only bites where an animated preview actually exists.
       const useAnimated = !!(prefs.preferAnimated && entry && entry.animated);
       const cacheKey = id + (useAnimated ? '#anim' : '#still');
@@ -563,58 +1218,41 @@ html, body, #root {
       const stillUrl = entry ? (entry.thumb || null) : null;
       const previewUrl = animUrl || stillUrl;
 
-      const candidates = [];
+      let pick = null;
       if (!useAnimated) {
         const pkg = await source.file(id, 'scene.pkg');
-        if (pkg) candidates.push.apply(candidates, await extractTextures(pkg));
+        if (pkg) {
+          status = { ...status, message: '正在合成场景图层…' };
+          emit();
+          let scene = null;
+          try {
+            scene = await renderScene(pkg);
+          } catch (e) {
+            scene = null;
+          }
+          // Some scenes cannot be reproduced by stacking textures: a puppet
+          // (mesh) subject is not a texture at all, and a script-driven scene
+          // can composite to a flat colour. The author's preview shows more.
+          const empty = scene && (flatness(scene.rgba, scene.w, scene.h) < FLAT_STD
+            || (scene.puppet > 0.2 && contentFraction(scene.rgba, scene.w, scene.h) < 0.5));
+          const previewEntry = previewUrl ? await measureUrl(previewUrl) : null;
+          if (scene && !(empty && previewEntry)) {
+            pick = { url: scene.url, w: scene.w, h: scene.h, layers: scene.layers };
+          } else if (scene) {
+            URL.revokeObjectURL(scene.url);
+            if (scene.puppet > 0.2) {
+              // The composite is missing its subject; a moving preview is the
+              // better of the two, so remember that for the UI.
+              artworkRes.set(id, { w: scene.w, h: scene.h, layers: scene.layers, puppet: true });
+            }
+          }
+        }
       }
-      if (previewUrl) {
+      if (!pick && previewUrl) {
         const m = await measureUrl(previewUrl);
-        if (m) candidates.push(m);
-      }
-
-      // Score every candidate by contrast before choosing.
-      for (let i = 0; i < candidates.length; i += 1) {
-        candidates[i].detail = await detailScore(candidates[i].url);
-      }
-
-      // Rank by "detail mass" — pixels times contrast — rather than by pixels
-      // alone. A pkg commonly holds several textures at the identical size,
-      // because the scene is composited from full-size layers at runtime, so
-      // area ties constantly and contrast is what separates the real picture
-      // from an empty atlas or a flat mask.
-      const mass = (c) => c.w * c.h * (c.detail === null ? MIN_DETAIL : c.detail);
-      const ranked = candidates.slice().sort((a, b) => mass(b) - mass(a));
-      // Keep a null detail (measurement failed) rather than discarding it; if
-      // nothing clears the contrast bar, fall back to everything so a
-      // wallpaper is never left blank.
-      const solid = ranked.filter((c) => c.detail === null || c.detail >= MIN_DETAIL);
-      const pool = solid.length > 0 ? solid : ranked;
-
-      let pick = null;
-      if (useAnimated && previewUrl) {
-        // Animation was asked for outright.
-        pick = candidates.find((c) => c.url === previewUrl) || pool[0] || null;
-      }
-      if (!pick) {
-        // A high-resolution texture is worth giving up the animation for; a
-        // small one is not, so an animated preview keeps winning below that bar.
-        const sharp = pool.find((c) => c.url !== previewUrl && c.w >= HIGH_RES_WIDTH);
-        pick = sharp
-          || pool.find((c) => c.url === previewUrl)
-          || pool[0]
-          || null;
+        if (m) pick = { url: m.url, w: m.w, h: m.h, layers: 0, preview: true };
       }
       if (!pick) return;
-
-      // Never revoke a URL the picker is still displaying.
-      const keep = new Set();
-      if (animUrl) keep.add(animUrl);
-      if (stillUrl) keep.add(stillUrl);
-      keep.add(pick.url);
-      for (let i = 0; i < candidates.length; i += 1) {
-        if (!keep.has(candidates[i].url)) URL.revokeObjectURL(candidates[i].url);
-      }
 
       // A GIF can momentarily lose its frame; stack its still first frame
       // underneath so the gap shows artwork instead of the dark canvas.
@@ -622,8 +1260,16 @@ html, body, #root {
       if (useAnimated && stillUrl && stillUrl !== pick.url) urls.push(stillUrl);
 
       artworkCache.set(cacheKey, urls);
-      artworkRes.set(id, { w: pick.w, h: pick.h, detail: pick.detail });
+      const prev = artworkRes.get(id) || {};
+      artworkRes.set(id, {
+        w: pick.w,
+        h: pick.h,
+        layers: pick.layers,
+        preview: !!pick.preview,
+        puppet: !!prev.puppet,
+      });
       if (layer) { layer.urls = urls; sync(); }
+      status = { ...status, message: '' };
       emit();
     }
 
@@ -812,15 +1458,15 @@ html, body, #root {
               },
             }, (function () {
               const r = artworkRes.get(cur.wallpaper);
-              if (!r) return '正在解析源图…';
+              if (!r) return '正在合成场景图层…';
               const size = r.w + '×' + r.h;
-              const detail = (r.detail === null || r.detail === undefined)
-                ? '?'
-                : Math.round(r.detail);
               const tag = r.w >= 1920 ? '清晰'
                 : r.w >= 1280 ? '尚可'
                 : '放大会糊，可调高「壁纸模糊」掩盖';
-              return '源图 ' + size + ' · 对比度 ' + detail + ' · ' + tag;
+              if (r.layers) {
+                return '合成 ' + r.layers + ' 层 · ' + size + ' · ' + tag;
+              }
+              return '预览图 ' + size + '（无 scene.pkg）· ' + tag;
             })()) : null,
             /* Live layer state, so a wallpaper that resolves but does not paint
                can be told apart from one that never resolved. */
@@ -894,7 +1540,7 @@ html, body, #root {
             style: { fontSize: '12px', color: 'var(--dsw-alias-label-tertiary)' },
           }, '重启后浏览器需要你再授权一次')) : null,
 
-        /* animated previews: sharper still vs moving GIF */
+        /* animated previews: sharper composite vs moving GIF */
         h(Row, null,
           h(Label, null, '动态壁纸'),
           h(Button, {
@@ -909,7 +1555,7 @@ html, body, #root {
           }, (function () {
             const n = library.filter((w) => w.animated).length;
             if (library.length === 0) return '选择文件夹后可用';
-            return n + ' 张有动图预览' + (cur.preferAnimated ? '' : '，其余取 scene.pkg 高清原图');
+            return n + ' 张有动图预览' + (cur.preferAnimated ? '' : '，其余按 scene.pkg 图层合成原图');
           })())),
 
         /* sliders */
