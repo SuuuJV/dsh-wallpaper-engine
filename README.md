@@ -8,6 +8,17 @@ Unlike most theme plugins, this one reads your actual workshop library — and f
 so you get the artwork itself rather than one layer of it or the ~768 px
 `preview.jpg` thumbnail.
 
+> **Want the wallpapers to actually move?** This plugin composites **one still
+> frame** per wallpaper. If you want the real thing — scene wallpapers rendered
+> live in WebGL (particles, puppet rigs, SceneScript, mouse parallax), video
+> wallpapers played and transcoded, web wallpapers sandboxed with the WE API,
+> system audio reaction, liquid-glass UI — use
+> **[elysia395/dsh-wallpaper-engine](https://github.com/elysia395/dsh-wallpaper-engine)**
+> instead. That is the mature DSH plugin for this job, and it is a different
+> project from this one despite the similar name. What this repository still
+> offers is a small, dependency-free still-frame compositor, and a readable
+> reference for the `scene.pkg` / `.tex` layer format.
+
 [中文说明](#中文说明)
 
 ---
@@ -193,6 +204,8 @@ files on your own machine and ships none of them.
 把你自己的 **Wallpaper Engine** 壁纸库用作 DeepSeek Harness 的应用背景，面板半透明磨砂。
 
 和大多数主题插件不同，这个插件读的是你**真实的创意工坊壁纸库**；对于 `scene` 类型的壁纸，它会把 `scene.pkg` 里的**图层合成成完整原画**，而不是只取其中一层、也不是将就那张约 768px 的 `preview.jpg` 缩略图。
+
+> **想让壁纸真的动起来？** 本插件每张壁纸只合成**一张静态帧**。如果你要的是完整效果 —— 场景壁纸用 WebGL **实时渲染**（粒子、puppet 骨骼、SceneScript 脚本、鼠标视差）、视频壁纸直接播放并转码、网页壁纸沙箱挂载 + WE API、系统音频反应、液态玻璃界面 —— 请用 **[elysia395/dsh-wallpaper-engine](https://github.com/elysia395/dsh-wallpaper-engine)**。那才是做这件事的成熟 DSH 插件；**它和本项目只是名字相近，是两个不同项目**。本仓库的价值在于：一个无依赖的小型静态帧合成器，以及一份可读的 `scene.pkg` / `.tex` 图层格式参考实现。
 
 ### 特点
 
