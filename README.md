@@ -99,10 +99,18 @@ The whole plugin is client-side.
   is visibly softer. In the sampled library 36 of 86 wallpapers had an animated
   preview, and 21 of those also had a `scene.pkg` — meaning the toggle actually
   changes the result for them.
-- **`scene.pkg` extraction is heuristic.** It finds the largest embedded image.
-  A few packages store nothing usable (their preview image is used instead), and
-  theoretically a package could have a larger decorative texture than its
-  artwork. Out of 86 sampled wallpapers, 58 extracted correctly.
+- **`scene.pkg` extraction is heuristic.** It recovers every embedded image and
+  then takes the sharpest of those *and* the folder's preview image, so a
+  package holding only sprites still falls back sensibly rather than being
+  rejected outright. A decorative texture larger than the artwork would still
+  win, and packages holding nothing usable fall back to the preview.
+- **Sharpness varies a lot between wallpapers**, and the settings page says so:
+  it reports the resolved source resolution and flags anything under 1280 px.
+  Two reasons. First, the source itself: Wallpaper Engine's `preview.jpg` ranges
+  from 160 px to 1080 px in the sampled library. Second, `background-size:
+  cover` scales by whichever axis needs more, so a *square* 728×728 preview in a
+  wide window is upscaled by its width — far more than a 1920×1080 image would
+  be. Raising **wallpaper blur** hides a low-resolution source rather well.
 - **A folder re-pick may be needed after reload**, depending on how the browser
   persists directory handles.
 - **Steam's per-wallpaper folders are keyed by workshop id**, which says nothing
@@ -168,7 +176,8 @@ dsh plugin install /本仓库的绝对路径/dsh-wallpaper-engine
 
 - **视频类壁纸不会被播放。** `video` 类型的壁纸是 `.mp4` 而不是 `scene.pkg`。在界面背后持续解码视频会一直占用 CPU，所以这类壁纸用它们的预览文件 —— 而当预览文件是 `preview.gif` 时，它正好是动的，等于白捡了动态效果。
 - **动态选项是拿清晰度换动作。** `preview.gif` 只有几百像素宽，所以优先用它会明显比抠出来的 `scene.pkg` 原图糊。在抽样的壁纸库里，86 张中有 36 张带动态预览，其中 21 张同时也有 `scene.pkg` —— 也就是说对它们而言这个开关是真的会改变效果的。
-- **`scene.pkg` 提取是启发式的。** 它取内嵌图片里最大的一张。少数包没有可用图片（则回退到预览图），理论上也可能存在比原画更大的装饰性贴图。抽样的 86 张壁纸里，58 张提取正确。
+- **`scene.pkg` 提取是启发式的。** 它会抠出所有内嵌图片，然后在内嵌图**和**同目录的预览图之间挑最清晰的一张 —— 所以即使某个包只装了零碎贴图，也会合理地回退，而不是被直接放弃。理论上仍可能存在比原画更大的装饰性贴图；完全没有可用图片的包则回退到预览图。
+- **不同壁纸的清晰度差别很大**，设置页也会如实告诉你：它会显示解析到的源图分辨率，低于 1280px 的会标黄提醒。原因有两个。一是**源图本身**：抽样库里 Wallpaper Engine 的 `preview.jpg` 从 160px 到 1080px 不等。二是 `background-size: cover` 会按“需要放大更多的那条边”来缩放，所以一张**方形**的 728×728 预览图在宽窗口里是按宽度放大的，放大倍数远高于 1920×1080 的图。把**「壁纸模糊」调高**能相当有效地掩盖低分辨率源图。
 - **刷新后可能需要重新选文件夹**，取决于浏览器对目录句柄的持久化行为。
 - **Steam 的每张壁纸文件夹以创意工坊 ID 命名**，看不出画面内容；标题来自各自的 `project.json`。
 

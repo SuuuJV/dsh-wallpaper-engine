@@ -44,8 +44,10 @@ window.__ModuleLoader__.load({
     const JPEG_EOI = [0xff, 0xd9];
     const PNG_SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
     const PNG_END = [0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82];
-    // Artwork smaller than this is a sprite or mask, not the wallpaper.
-    const MIN_ARTWORK_WIDTH = 1280;
+    // Below this width an embedded image is a sprite or mask, not the artwork.
+    // Deliberately low: a 700 px texture still beats a 300 px preview, and the
+    // old 1280 floor threw such textures away in favour of the preview.
+    const MIN_USABLE_WIDTH = 480;
 
     /* ── small utilities ────────────────────────────────────────────── */
 
@@ -161,37 +163,40 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * scene.pkg stores its textures as plain JPEG/PNG streams, so the largest
-     * one at least MIN_ARTWORK_WIDTH wide is the wallpaper itself.
+     * Every decodable image embedded in a scene.pkg, largest first.
+     * scene.pkg stores its textures as plain JPEG/PNG streams, so a magic-byte
+     * scan recovers them.
      */
-    async function extractArtwork(pkgFile) {
+    async function extractTextures(pkgFile) {
       let bytes;
       try {
         bytes = new Uint8Array(await pkgFile.arrayBuffer());
       } catch (e) {
-        return null;
+        return [];
       }
 
       const spans = []
         .concat(findSpans(bytes, JPEG_SOI, JPEG_EOI))
         .concat(findSpans(bytes, PNG_SIG, PNG_END));
 
-      let best = null;
-      const kept = [];
+      const out = [];
       for (let i = 0; i < spans.length; i += 1) {
         const span = spans[i];
-        const blob = new Blob([bytes.subarray(span[0], span[1])]);
-        const info = await measure(blob);
-        if (!info) continue;
-        if (info.w < MIN_ARTWORK_WIDTH) { URL.revokeObjectURL(info.url); continue; }
-        kept.push({ area: info.w * info.h, info });
+        const info = await measure(new Blob([bytes.subarray(span[0], span[1])]));
+        if (info) out.push(info);
       }
-      kept.sort((a, b) => b.area - a.area);
-      if (kept.length > 0) {
-        best = kept[0].info.url;
-        for (let i = 1; i < kept.length; i += 1) URL.revokeObjectURL(kept[i].info.url);
-      }
-      return best;
+      out.sort((a, b) => b.w * b.h - a.w * a.h);
+      return out;
+    }
+
+    /** Size of an image URL that already exists (a preview Blob URL, say). */
+    function measureUrl(url) {
+      return new Promise((resolve) => {
+        const im = new Image();
+        im.onload = () => resolve({ url, w: im.naturalWidth, h: im.naturalHeight });
+        im.onerror = () => resolve(null);
+        im.src = url;
+      });
     }
 
     /* ── library sources ────────────────────────────────────────────── */
@@ -401,6 +406,8 @@ html, body, #root {
     let ctxRef = null;
     /** Cache of extracted artwork URLs, keyed by workshop id. */
     const artworkCache = new Map();
+    /** Resolved source resolution per wallpaper id, for honest UI feedback. */
+    const artworkRes = new Map();
 
     const listeners = new Set();
     function emit() {
@@ -464,17 +471,39 @@ html, body, #root {
         return;
       }
 
-      let url = null;
+      const thumbUrl = entry ? entry.thumb : null;
+      const candidates = [];
       if (!useAnimated) {
         const pkg = await source.file(id, 'scene.pkg');
-        if (pkg) url = await extractArtwork(pkg);
+        if (pkg) candidates.push.apply(candidates, await extractTextures(pkg));
       }
-      // Fall back to the preview — for video wallpapers it is all there is.
-      if (!url && entry && entry.thumb) url = entry.thumb;
-      if (!url) return;
+      if (thumbUrl) {
+        const m = await measureUrl(thumbUrl);
+        if (m) candidates.push(m);
+      }
 
-      artworkCache.set(cacheKey, url);
-      if (layer) { layer.url = url; sync(); }
+      // Animation wins outright when asked for; otherwise take the sharpest
+      // candidate, falling back to the preview if the package held only
+      // sprites. Whichever is picked, the resolution is recorded so the UI can
+      // be honest about how much upscaling a wallpaper needs.
+      let pick = null;
+      if (useAnimated && thumbUrl) {
+        pick = candidates.find((c) => c.url === thumbUrl) || null;
+      }
+      if (!pick) {
+        const ranked = candidates.slice().sort((a, b) => b.w * b.h - a.w * a.h);
+        pick = ranked.find((c) => c.w >= MIN_USABLE_WIDTH) || ranked[0] || null;
+      }
+      if (!pick) return;
+
+      for (let i = 0; i < candidates.length; i += 1) {
+        const c = candidates[i];
+        if (c !== pick && c.url !== thumbUrl) URL.revokeObjectURL(c.url);
+      }
+
+      artworkCache.set(cacheKey, pick.url);
+      artworkRes.set(id, pick.w + '×' + pick.h);
+      if (layer) { layer.url = pick.url; sync(); }
       emit();
     }
 
@@ -643,6 +672,24 @@ html, body, #root {
             h('div', {
               style: { fontSize: '12px', marginTop: '4px', color: 'var(--dsw-alias-label-tertiary)' },
             }, current ? ('ID ' + current.id) : '先选择你的 Wallpaper Engine 文件夹'),
+            current ? h('div', {
+              style: {
+                fontSize: '12px', marginTop: '2px',
+                color: (function () {
+                  const r = artworkRes.get(cur.wallpaper);
+                  return r && parseInt(r, 10) < 1280
+                    ? 'var(--dsw-alias-state-warn-primary)'
+                    : 'var(--dsw-alias-label-tertiary)';
+                })(),
+              },
+            }, (function () {
+              const r = artworkRes.get(cur.wallpaper);
+              if (!r) return '正在解析源图…';
+              const w = parseInt(r, 10);
+              if (w >= 1920) return '源图 ' + r + ' · 清晰';
+              if (w >= 1280) return '源图 ' + r + ' · 尚可';
+              return '源图仅 ' + r + ' · 放大会糊，可调高「壁纸模糊」掩盖';
+            })()) : null,
             h('div', {
               style: {
                 fontSize: '12px', marginTop: '2px',
