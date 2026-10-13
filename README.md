@@ -159,6 +159,27 @@ and against the wallpapers' own preview images: identical layer stacks for all
 - **Steam's per-wallpaper folders are keyed by workshop id**, which says nothing
   about the artwork; titles come from each `project.json`.
 
+## Credits and disclaimer
+
+This plugin is unofficial. It is not affiliated with, endorsed by, or sponsored
+by Wallpaper Engine (Kristjan Skutta) or DeepSeek; their names are used
+descriptively, to say what this plugin works with and where it runs.
+
+No artwork ships in this repository. The plugin reads the wallpaper files you
+already have on your own machine, composites them in memory and puts the result
+behind the UI as a Blob URL — nothing is uploaded, copied into the repository or
+redistributed. What you display stays under its own licence, and Wallpaper
+Engine's terms continue to apply to the files it downloaded.
+
+The file-format knowledge behind the scene renderer — the PKGV container, the
+TEXV/TEXB texture containers, the LZ4 block layout, DXT blocks — is public
+community reverse-engineering. The implementations here were written against the
+file layouts themselves and checked layer by layer against real packages; no
+code from any other project is included. Prior art worth naming, and worth
+reading if you want the same formats explained from another angle:
+[RePKG](https://github.com/notscuffed/repkg) and
+[linux-wallpaperengine](https://github.com/Almamu/linux-wallpaperengine).
+
 ## License
 
 MIT. Wallpaper artwork belongs to its respective authors — this plugin reads the
@@ -240,6 +261,14 @@ WPE_LIBRARY=~/.steam/steam/steamapps/workshop/content/431960 node test/scene-ren
 - **不同壁纸的清晰度差别很大**，设置页也会如实告诉你：它会显示合成尺寸和图层数，低于 1280px 的会标黄提醒。原因有两个。一是**源图本身**：抽样库里 Wallpaper Engine 的 `preview.jpg` 从 160px 到 1080px 不等，而某些 `scene.pkg` 的原画本来就是一张小贴图。二是 `background-size: cover` 会按“需要放大更多的那条边”来缩放，所以一张**方形**的 728×728 预览图在宽窗口里是按宽度放大的，放大倍数远高于 1920×1080 的图。把**「壁纸模糊」调高**能相当有效地掩盖低分辨率源图。
 - **刷新后可能需要重新选文件夹**，取决于浏览器对目录句柄的持久化行为。
 - **Steam 的每张壁纸文件夹以创意工坊 ID 命名**，看不出画面内容；标题来自各自的 `project.json`。
+
+### 致谢与免责
+
+本插件是非官方作品，与 Wallpaper Engine（作者 Kristjan Skutta）及 DeepSeek **均无隶属、赞助或背书关系**；提及二者的名字只是为了说明它适配什么、跑在哪里。
+
+仓库内**不附带任何壁纸素材**。插件只读取你自己机器上已有的壁纸文件，在内存里合成后作为 Blob URL 放到界面后面 —— 不上传、不复制进仓库、不再分发。你显示的画面版权仍属原作者，Wallpaper Engine 自身的条款也照旧适用于它下载的那些文件。
+
+场景合成用到的格式知识（PKGV 容器、TEXV/TEXB 贴图容器、LZ4 块结构、DXT 块）属于社区公开的逆向成果；本项目的实现是照着文件结构本身写的，并用真实壁纸包逐层验证过，**未包含任何第三方项目的代码**。值得一提的前作（换个角度讲同一套格式，值得一读）：[RePKG](https://github.com/notscuffed/repkg) 与 [linux-wallpaperengine](https://github.com/Almamu/linux-wallpaperengine)。
 
 ### 许可
 
