@@ -406,16 +406,27 @@ html, body, #root {
       root.appendChild(img);
       root.appendChild(dim);
       document.body.appendChild(root);
-      return { root, img, dim, url: null };
+      return { root, img, dim, urls: [] };
     }
 
+    /**
+     * Paint the layer. `layer.urls` is ordered front-to-back: an animated GIF
+     * that drops a frame for a moment would otherwise reveal the dark canvas
+     * behind the layer as a black flash, so the still first frame is stacked
+     * underneath it to absorb that.
+     */
     function paintLayer(layer, prefs) {
       const blur = clamp(prefs.blur, 0, 60, DEFAULTS.blur);
       const dim = clamp(prefs.dim, 0, 0.85, DEFAULTS.dim);
       const opacity = clamp(prefs.imageOpacity, 0, 1, 1);
+      const urls = layer.urls || [];
 
-      if (layer.url) {
-        layer.img.style.backgroundImage = 'url("' + layer.url + '")';
+      if (urls.length > 0) {
+        layer.img.style.backgroundImage = urls
+          .map((u) => 'url("' + u + '")')
+          .join(', ');
+        layer.img.style.backgroundSize = urls.map(() => 'cover').join(', ');
+        layer.img.style.backgroundPosition = urls.map(() => 'center').join(', ');
         layer.img.style.opacity = String(opacity);
         // Blur the wallpaper itself; backdrop-filter would create a containing
         // block and break every position:fixed control inside the frame.
@@ -463,7 +474,7 @@ html, body, #root {
       if (!layer) return;
       // With no wallpaper resolved there is nothing to show, so leave the app
       // completely untouched rather than tinting panels over a blank layer.
-      if (!prefs.enabled || !layer.url) {
+      if (!prefs.enabled || !layer.urls || layer.urls.length === 0) {
         layer.root.style.display = 'none';
         if (disposeTokens) { disposeTokens(); disposeTokens = null; }
         return;
@@ -488,7 +499,7 @@ html, body, #root {
     /** Resolve the chosen wallpaper to a URL and put it on the layer. */
     async function applyWallpaper(id) {
       if (!id) {
-        if (layer) { layer.url = null; sync(); }
+        if (layer) { layer.urls = []; sync(); }
         return;
       }
 
@@ -502,7 +513,7 @@ html, body, #root {
       const cacheKey = id + (useAnimated ? '#anim' : '#still');
 
       if (artworkCache.has(cacheKey)) {
-        if (layer) { layer.url = artworkCache.get(cacheKey); sync(); }
+        if (layer) { layer.urls = artworkCache.get(cacheKey); sync(); }
         return;
       }
 
@@ -545,9 +556,14 @@ html, body, #root {
         if (!keep.has(candidates[i].url)) URL.revokeObjectURL(candidates[i].url);
       }
 
-      artworkCache.set(cacheKey, pick.url);
+      // A GIF can momentarily lose its frame; stack its still first frame
+      // underneath so the gap shows artwork instead of the dark canvas.
+      const urls = [pick.url];
+      if (useAnimated && stillUrl && stillUrl !== pick.url) urls.push(stillUrl);
+
+      artworkCache.set(cacheKey, urls);
       artworkRes.set(id, pick.w + '×' + pick.h);
-      if (layer) { layer.url = pick.url; sync(); }
+      if (layer) { layer.urls = urls; sync(); }
       emit();
     }
 
@@ -961,7 +977,9 @@ html, body, #root {
               if (w.thumb) URL.revokeObjectURL(w.thumb);
               if (w.anim && w.anim !== w.thumb) URL.revokeObjectURL(w.anim);
             });
-            artworkCache.forEach((url) => URL.revokeObjectURL(url));
+            artworkCache.forEach((urls) => {
+              urls.forEach((u) => URL.revokeObjectURL(u));
+            });
             artworkCache.clear();
             if (layer && layer.root.parentNode) layer.root.parentNode.removeChild(layer.root);
             layer = null;
