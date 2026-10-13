@@ -48,6 +48,9 @@ window.__ModuleLoader__.load({
     // Deliberately low: a 700 px texture still beats a 300 px preview, and the
     // old 1280 floor threw such textures away in favour of the preview.
     const MIN_USABLE_WIDTH = 480;
+    // At or above this, an embedded scene.pkg texture is clearly the better
+    // source — sharp enough to be worth giving up an animation for.
+    const HIGH_RES_WIDTH = 1280;
 
     /* ── small utilities ────────────────────────────────────────────── */
 
@@ -393,11 +396,8 @@ html, body, #root {
 
       const img = document.createElement('div');
       img.setAttribute('data-wpe', 'image');
-      // `will-change` keeps the layer composited on the GPU, which stops an
-      // animated source from occasionally re-rasterizing into a blank frame.
       img.style.cssText =
-        'position:absolute;inset:0;background-size:cover;background-position:center;' +
-        'will-change:transform';
+        'position:absolute;inset:0;background-size:cover;background-position:center';
 
       const dim = document.createElement('div');
       dim.setAttribute('data-wpe', 'dim');
@@ -517,33 +517,39 @@ html, body, #root {
         return;
       }
 
-      // The animated URL is the moving one; the still (its first frame) is what
-      // the picker displays, so it doubles as a safe non-animated candidate.
+      // The animated URL is the moving one; the still is its first frame, used
+      // by the picker and as the layer's backstop. A wallpaper whose only
+      // artwork *is* an animated preview has to keep using that preview —
+      // falling back to the baked still would silently make it a static image.
       const animUrl = entry ? (entry.anim || null) : null;
       const stillUrl = entry ? (entry.thumb || null) : null;
-      const wantUrl = useAnimated ? (animUrl || stillUrl) : stillUrl;
+      const previewUrl = animUrl || stillUrl;
 
       const candidates = [];
       if (!useAnimated) {
         const pkg = await source.file(id, 'scene.pkg');
         if (pkg) candidates.push.apply(candidates, await extractTextures(pkg));
       }
-      if (wantUrl) {
-        const m = await measureUrl(wantUrl);
+      if (previewUrl) {
+        const m = await measureUrl(previewUrl);
         if (m) candidates.push(m);
       }
 
-      // Animation wins outright when asked for; otherwise take the sharpest
-      // candidate, falling back to the preview if the package held only
-      // sprites. Whichever is picked, the resolution is recorded so the UI can
-      // be honest about how much upscaling a wallpaper needs.
       let pick = null;
-      if (useAnimated && wantUrl) {
-        pick = candidates.find((c) => c.url === wantUrl) || candidates[0] || null;
+      if (useAnimated && previewUrl) {
+        // Animation was asked for outright.
+        pick = candidates.find((c) => c.url === previewUrl) || candidates[0] || null;
       }
       if (!pick) {
         const ranked = candidates.slice().sort((a, b) => b.w * b.h - a.w * a.h);
-        pick = ranked.find((c) => c.w >= MIN_USABLE_WIDTH) || ranked[0] || null;
+        // A high-resolution texture is worth losing the animation for; a small
+        // one is not, so the moving preview wins there.
+        const sharp = ranked.find((c) => c.url !== previewUrl && c.w >= HIGH_RES_WIDTH);
+        pick = sharp
+          || ranked.find((c) => c.url === previewUrl)
+          || ranked.find((c) => c.w >= MIN_USABLE_WIDTH)
+          || ranked[0]
+          || null;
       }
       if (!pick) return;
 
