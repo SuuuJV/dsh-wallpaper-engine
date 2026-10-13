@@ -44,10 +44,6 @@ window.__ModuleLoader__.load({
     const JPEG_EOI = [0xff, 0xd9];
     const PNG_SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
     const PNG_END = [0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82];
-    // Below this width an embedded image is a sprite or mask, not the artwork.
-    // Deliberately low: a 700 px texture still beats a 300 px preview, and the
-    // old 1280 floor threw such textures away in favour of the preview.
-    const MIN_USABLE_WIDTH = 480;
     // At or above this, an embedded scene.pkg texture is clearly the better
     // source — sharp enough to be worth giving up an animation for.
     const HIGH_RES_WIDTH = 1280;
@@ -582,22 +578,30 @@ html, body, #root {
         candidates[i].detail = await detailScore(candidates[i].url);
       }
 
+      // Rank by "detail mass" — pixels times contrast — rather than by pixels
+      // alone. A pkg commonly holds several textures at the identical size,
+      // because the scene is composited from full-size layers at runtime, so
+      // area ties constantly and contrast is what separates the real picture
+      // from an empty atlas or a flat mask.
+      const mass = (c) => c.w * c.h * (c.detail === null ? MIN_DETAIL : c.detail);
+      const ranked = candidates.slice().sort((a, b) => mass(b) - mass(a));
+      // Keep a null detail (measurement failed) rather than discarding it; if
+      // nothing clears the contrast bar, fall back to everything so a
+      // wallpaper is never left blank.
+      const solid = ranked.filter((c) => c.detail === null || c.detail >= MIN_DETAIL);
+      const pool = solid.length > 0 ? solid : ranked;
+
       let pick = null;
       if (useAnimated && previewUrl) {
         // Animation was asked for outright.
-        pick = candidates.find((c) => c.url === previewUrl) || candidates[0] || null;
+        pick = candidates.find((c) => c.url === previewUrl) || pool[0] || null;
       }
       if (!pick) {
-        const ranked = candidates.slice().sort((a, b) => b.w * b.h - a.w * a.h);
-        // Drop masks and blank frames; keep a null score (measurement failed)
-        // rather than silently discarding a candidate. If nothing survives,
-        // fall back to everything so a wallpaper is never left blank.
-        const solid = ranked.filter((c) => c.detail === null || c.detail >= MIN_DETAIL);
-        const pool = solid.length > 0 ? solid : ranked;
+        // A high-resolution texture is worth giving up the animation for; a
+        // small one is not, so an animated preview keeps winning below that bar.
         const sharp = pool.find((c) => c.url !== previewUrl && c.w >= HIGH_RES_WIDTH);
         pick = sharp
           || pool.find((c) => c.url === previewUrl)
-          || pool.find((c) => c.w >= MIN_USABLE_WIDTH)
           || pool[0]
           || null;
       }
