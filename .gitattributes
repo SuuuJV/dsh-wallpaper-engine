@@ -1,0 +1,6 @@
+# Keep line endings stable across platforms, and never rewrite the diff of
+# files that legitimately contain CRLF.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.gif binary

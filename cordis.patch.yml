@@ -1,0 +1,4 @@
+- insert:
+    - id: wallpaper-engine
+      name: 'dsh-wallpaper-engine'
+      config: {}

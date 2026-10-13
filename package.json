@@ -1,0 +1,44 @@
+{
+  "name": "dsh-wallpaper-engine",
+  "version": "0.1.0",
+  "description": "Use your own Wallpaper Engine library as the DeepSeek Harness app background, with frosted translucent panels.",
+  "type": "module",
+  "license": "MIT",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale",
+    "icon.svg",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "wallpaper-engine",
+    "wallpaper",
+    "theme",
+    "background",
+    "frosted-glass"
+  ],
+  "meta": {
+    "title": "Wallpaper Engine Background",
+    "description": "Browse your Wallpaper Engine library and use it as the app background."
+  },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  }
+}
